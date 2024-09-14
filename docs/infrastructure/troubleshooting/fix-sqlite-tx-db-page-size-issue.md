@@ -2,38 +2,33 @@
 html: fix-sqlite-tx-db-page-size-issue.html
 parent: troubleshoot-the-rippled-server.html
 seo:
-    description: Fix a problem with the SQLite page size on full-history servers started on rippled version 0.40.0 or earlier.
-status: removed
+    description: Fix a problem with the SQLite page size on full-history servers.
 ---
 # Fix SQLite Transaction Database Page Size Issue
 
-`rippled` servers with full [ledger history](../../concepts/networks-and-servers/ledger-history.md) (or a very large amount of transaction history) and a database that was initially created with a `rippled` version earlier than 0.40.0 (released January 2017) may encounter a problem with their SQLite database page size that stops the server from operating properly. Servers that store only recent transaction history (the default configuration) and servers whose database files were created with `rippled` version 0.40.0 and later are not likely to have this problem. <!-- STYLE_OVERRIDE: encounter -->
+`rippled` servers with full [ledger history](../../concepts/networks-and-servers/ledger-history.md) (or a very large amount of transaction history) may encounter a problem with their SQLite database page size and/or maximum page count that stops the server from operating properly. Servers that store only recent transaction history (the default configuration) are not likely to have this problem. <!-- STYLE_OVERRIDE: encounter -->
 
 This document describes steps to detect and correct this problem if it occurs.
 
 ## Background
 
-`rippled` servers store a copy of their transaction history in a SQLite database. Before version 0.40.0, `rippled` configured this database to have a capacity of roughly 2 TB. For most uses, this is plenty. However, full transaction history back to ledger 32570 (the oldest ledger version available in the production XRP Ledger history) is likely to exceed this exceed the SQLite database capacity. `rippled` servers version 0.40.0 and later create their SQLite database files with a larger capacity, so they are unlikely to encounter this problem.
+`rippled` servers store a copy of their transaction history in a SQLite database. Before version 0.40.0, `rippled` configured this database to have a capacity of roughly 2 TB. For most uses, this was plenty. However, full transaction history back to ledger 32570 (the oldest ledger version available in the production XRP Ledger history) exceeds that SQLite database capacity. `rippled` servers version 0.40.0 and later create their SQLite database files with a larger capacity, roughly 8 TB. Starting with version 2.2.3, `rippled` attempts to set `max_page_count=4294967294`, which is the SQLite default as of SQLite 3.45.0 (2024-01.15). With a page size of 4096 bytes, this allows for roughly 17 TB. With a page size of 65536 bytes, the database can grow to roughly 281 TB.
 
-The capacity of the SQLite database is a result of the database's _page size_ parameter, which cannot be easily changed after the database is created. (For more information on SQLite's internals, see [the official SQLite documentation](https://www.sqlite.org/fileformat.html).) The database can reach its capacity even if there is still free space on the disk and filesystem where it is stored. As described in the [Fix](#fix) below, reconfiguring the page size to avoid this problem requires a somewhat time-consuming migration process. <!-- STYLE_OVERRIDE: easily -->
+The capacity of the SQLite database is a result of the database's _page size_ parameter, which cannot be easily changed after the database is created, and SQLite's _max_page_count_ parameter. (For more information on SQLite's internals, see [the official SQLite documentation](https://www.sqlite.org/fileformat.html).) The database can reach its capacity even if there is still free space on the disk and filesystem where it is stored. As described in the [Fix](#fix) below, reconfiguring the page size to avoid this problem requires a somewhat time-consuming migration process. <!-- STYLE_OVERRIDE: easily -->
 
-**Tip:** Full history is not necessary for most use cases. Servers with full transaction history may be useful for long-term analysis and archive purposes or as a precaution against disasters. For a less resource-intense way to contribute to the storage of transaction history, see [History Sharding](../configuration/data-retention/history-sharding.md).
+**Tip:** Full history is not necessary for most use cases. Servers with full transaction history may be useful for long-term analysis and archive purposes or as a precaution against disasters. For a less resource-intense way to store transaction history, see [the Clio server](../../concepts/networks-and-servers/the-clio-server).
 
 
 ## Detection
 
 If your server is vulnerable to this problem, you can detect it two ways:
 
-- You can detect the problem [proactively](#proactive-detection) (before it causes problems) if your `rippled` server is version 1.1.0 or later.
-- You can identify the problem [reactively](#reactive-detection) (when your server is crashing) on any `rippled` version.
-
-In both cases, detection of the problem requires access to `rippled`'s server logs.
+- You can detect the problem [proactively](#proactive-detection) (before it causes problems)
+- You can identify the problem [reactively](#reactive-detection) (when your server is crashing)
 
 **Tip:** The location of the debug log depends on your `rippled` server's config file. The [default configuration](https://github.com/XRPLF/rippled/blob/master/cfg/rippled-example.cfg#L1139-L1142) writes the server's debug log to the file `/var/log/rippled/debug.log`.
 
-### Proactive Detection
-
-To detect the SQLite page size problem proactively, you must be running **`rippled` 1.1.0 or later**. The `rippled` server writes a message such as the following in its debug log periodically, at least once every 2 minutes. (The exact numeric values from the log entry and the path to your transaction database depend on your environment.)
+The `rippled` server writes a message such as the following in its debug log periodically, at least once every 2 minutes. (The exact numeric values from the log entry and the path to your transaction database depend on your environment.)
 
 ```text
 Transaction DB pathname: /opt/rippled/transaction.db; SQLite page size: 1024
@@ -41,17 +36,17 @@ Transaction DB pathname: /opt/rippled/transaction.db; SQLite page size: 1024
   does not take into account available disk space.
 ```
 
-The value `SQLite page size: 1024 bytes` indicates that your transaction database is configured with a smaller page size and does not have capacity for full transaction history. If the value is already 4096 bytes or higher, then your SQLite database should already have adequate capacity to store full transaction history and you do not need to perform the migration described in this document.
+The value `SQLite page size: 1024 bytes` indicates that your transaction database is configured with a small page size and does not have capacity for full transaction history. If the value is already 4096 bytes or higher, then your SQLite database may have adequate capacity to store full transaction history.
+
+The maximum size of the transaction database can be calculated by multiplying the page size and the maximum page count. For example, if the page size is 4096 bytes, and `max_page_count=2147483646`:
+
+4096 bytes * 2147483646 = 8.79609301 terabytes.
 
 The `rippled` server halts if the `Free space` described in this log message becomes less than 524288000 bytes (500 MB). If your free space is approaching that threshold, [fix the problem](#fix) to avoid an unexpected outage.
 
 ### Reactive Detection
 
-If your server's SQLite database capacity has already been exceeded, the `rippled` service writes a log message indicating the problem and halts.
-
-#### rippled 1.1.0 and Later
-
-On `rippled` versions 1.1.0 and later, the server shuts down gracefully with a message such as the following in the server's debug log:
+If your server's SQLite database capacity has already been exceeded, the `rippled` service writes a log message indicating the problem and halts. The server shuts down gracefully with a message such as the following in the server's debug log:
 
 ```text
 Free SQLite space for transaction db is less than 512MB. To fix this, rippled
@@ -59,26 +54,13 @@ Free SQLite space for transaction db is less than 512MB. To fix this, rippled
   Note that this activity can take multiple days, depending on database size.
 ```
 
-#### Earlier than rippled 1.1.0
-
-On `rippled` versions before 1.1.0, the server crashes repeatedly with messages such as the following in the server's debug log:
-
-```text
-Terminating thread doJob: AcquisitionDone: unhandled
-  N4soci18sqlite3_soci_errorE 'sqlite3_statement_backend::loadOne: database or
-  disk is full while executing "INSERT INTO [...]
-```
-
-
 ## Fix
 
 You can fix this issue using `rippled` on supported Linux systems according to the steps described in this document. In the case of a full-history server with system specs approximately matching the [recommended hardware configuration](../installation/capacity-planning.md#recommendation-1), the process may take more than two full days.
 
 ### Prerequisites
 
-- You must be running **`rippled` version 1.1.0 or later**.
-
-    - [Upgrade rippled](../installation/index.md) to the latest stable version before starting this process.
+- [Upgrade rippled](../installation/index.md) to the latest stable version before starting this process.
 
     - You can check what version of `rippled` you have installed locally by running the following command:
 
